@@ -1,0 +1,164 @@
+name: Create development branch from issue
+
+on:
+  issues:
+    types:
+      - opened
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  validate:
+    name: Validate issue format
+    runs-on: ubuntu-latest
+
+    if: contains(github.event.issue.labels.*.name, 'branch-request')
+
+    outputs:
+      branch_name: ${{ steps.parse.outputs.branch_name }}
+      source_branch: ${{ steps.parse.outputs.source_branch }}
+
+    steps:
+      - name: Parse issue body
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body || "";
+
+            function extract(label) {
+              const regex = new RegExp(`### ${label}\\s+([\\s\\S]*?)(?=\\n### |$)`);
+              const match = body.match(regex);
+              return match ? match[1].trim() : "";
+            }
+
+            const title = extract("タイトル");
+            const branchName = extract("開発ブランチ名");
+            const sourceBranch = extract("元ブランチ");
+
+            const errors = [];
+
+            if (!title) errors.push("タイトルが未入力です。");
+            if (!branchName) errors.push("開発ブランチ名が未入力です。");
+            if (!sourceBranch) errors.push("元ブランチが未入力です。");
+
+            if (/\s/.test(branchName)) {
+              errors.push("開発ブランチ名に空白は使えません。");
+            }
+
+            if (!/^(feature|fix|hotfix|release)\/[A-Za-z0-9._-]+$/.test(branchName)) {
+              errors.push("開発ブランチ名は feature/xxx, fix/xxx, hotfix/xxx, release/xxx の形式にしてください。");
+            }
+
+            if (!/^[A-Za-z0-9._/-]+$/.test(sourceBranch)) {
+              errors.push("元ブランチ名の形式が不正です。");
+            }
+
+            if (errors.length > 0) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: [
+                  "ブランチ作成依頼のフォーマットが不正です。",
+                  "",
+                  ...errors.map(e => `- ${e}`),
+                  "",
+                  "Issueを修正して再作成してください。"
+                ].join("\n")
+              });
+
+              throw new Error(errors.join("\n"));
+            }
+
+            core.setOutput("branch_name", branchName);
+            core.setOutput("source_branch", sourceBranch);
+
+      - name: Comment approval waiting
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                "フォーマット確認OKです。",
+                "",
+                "承認待ちに進みました。",
+                "承認者が GitHub Actions の Review deployments から Approve すると、ブランチが作成されます。"
+              ].join("\n")
+            });
+
+  approval:
+    name: Wait for approval
+    needs: validate
+    runs-on: ubuntu-latest
+    environment: branch-creation-approval
+
+    steps:
+      - name: Show request
+        run: |
+          echo "Issue: #${{ github.event.issue.number }}"
+          echo "Requester: ${{ github.event.issue.user.login }}"
+          echo "Branch: ${{ needs.validate.outputs.branch_name }}"
+          echo "Source: ${{ needs.validate.outputs.source_branch }}"
+
+  create-branch:
+    name: Create branch
+    needs:
+      - validate
+      - approval
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.source_branch }}
+
+      - name: Create branch
+        run: |
+          git fetch origin
+
+          BRANCH="${{ needs.validate.outputs.branch_name }}"
+
+          if git ls-remote --exit-code --heads origin "$BRANCH"; then
+            echo "Branch already exists: $BRANCH"
+            exit 1
+          fi
+
+          git checkout -b "$BRANCH"
+          git push origin "$BRANCH"
+
+      - name: Notify requester
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const requester = context.payload.issue.user.login;
+            const branch = `${{ needs.validate.outputs.branch_name }}`;
+            const source = `${{ needs.validate.outputs.source_branch }}`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                `@${requester}`,
+                "",
+                "承認後、開発ブランチを作成しました。",
+                "",
+                `- 開発ブランチ名: \`${branch}\``,
+                `- 元ブランチ: \`${source}\``,
+                `- 実行URL: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+              ].join("\n")
+            });
+
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: "closed"
+            });
